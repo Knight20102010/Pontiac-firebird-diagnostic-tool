@@ -5,29 +5,23 @@ BluetoothSerial SerialBT;
 const int ALDL_PIN = 27;
 
 // ============================================================
-// 160 BAUD ALDL - NOISE FILTER
+// ALDL 160 BAUD - FILTER SIGNALU
 // ============================================================
 
-// Jeden bit pri 160 baud = cca 6250 us.
-// Novy platny zaciatok bitu nepovolime skor ako po 5000 us.
-const uint32_t MIN_BIT_SPACING_US = 5000;
-
-// Nami namerane:
-// BIT 0 cca 365 us
-// BIT 1 cca 4395 us
-const uint32_t MIN_PULSE_US = 150;
-const uint32_t BIT_SPLIT_US = 2200;
-const uint32_t MAX_PULSE_US = 6000;
+const unsigned long MIN_BIT_SPACING_US = 5000;
+const unsigned long MIN_PULSE_US       = 150;
+const unsigned long BIT_SPLIT_US       = 2200;
+const unsigned long MAX_PULSE_US       = 6000;
 
 
 // ============================================================
-// SIGNAL
+// ISR / SIGNAL
 // ============================================================
-volatile uint32_t pulseStart = 0;
-volatile uint32_t lastBitStart = 0;
 
-volatile bool haveBitCell = false;
-volatile bool bitAlreadyRead = false;
+volatile unsigned long pulseStart = 0;
+volatile unsigned long lastAcceptedRise = 0;
+
+volatile bool pulseActive = false;
 
 volatile unsigned long validBitsTotal = 0;
 volatile unsigned long ignoredEdgesTotal = 0;
@@ -37,23 +31,32 @@ volatile unsigned long invalidPulsesTotal = 0;
 // ============================================================
 // ALDL SYNCHRONIZACIA
 // ============================================================
+
 volatile uint16_t syncShift = 0;
 volatile bool synced = false;
 
 volatile uint16_t word9 = 0;
 volatile uint8_t bitCount = 0;
 
+
+// ============================================================
+// FRAME BUFFERY
+// ============================================================
+
+// Aktualny frame
 volatile uint8_t currentFrame[32];
 volatile uint8_t currentLength = 0;
 
+// Hotovy frame
 volatile uint8_t readyFrame[32];
 volatile uint8_t readyLength = 0;
 volatile bool frameReady = false;
 
 
 // ============================================================
-// HOTOVY FRAME
+// ULOZENIE HOTOVEHO FRAME
 // ============================================================
+
 void IRAM_ATTR finishFrame()
 {
   if (currentLength > 0)
@@ -75,17 +78,19 @@ void IRAM_ATTR finishFrame()
 // ============================================================
 // PRIDANIE BITU
 // ============================================================
+
 void IRAM_ATTR addBit(uint8_t bitValue)
 {
   validBitsTotal++;
 
-  // Neustale hladame SYNC 111111111
   syncShift =
     ((syncShift << 1) | (bitValue & 0x01)) & 0x01FF;
 
-  // ==========================================================
-  // SYNC = 0x1FF
-  // ==========================================================
+
+  // ----------------------------------------------------------
+  // SYNC = 111111111
+  // ----------------------------------------------------------
+
   if (syncShift == 0x01FF)
   {
     if (synced && currentLength > 0)
@@ -97,18 +102,19 @@ void IRAM_ATTR addBit(uint8_t bitValue)
 
     word9 = 0;
     bitCount = 0;
-    currentLength = 0;
 
     return;
   }
+
 
   if (!synced)
     return;
 
 
-  // ==========================================================
-  // SKLADANIE 9-BIT SLOVA
-  // ==========================================================
+  // ----------------------------------------------------------
+  // 9-BIT ALDL DATA WORD
+  // ----------------------------------------------------------
+
   word9 =
     ((word9 << 1) | (bitValue & 0x01)) & 0x01FF;
 
@@ -117,13 +123,18 @@ void IRAM_ATTR addBit(uint8_t bitValue)
   if (bitCount < 9)
     return;
 
+
   uint16_t w = word9;
 
   word9 = 0;
   bitCount = 0;
 
 
-  // Normalny datovy byte musi mat 9. bit = 0
+  // ----------------------------------------------------------
+  // Datove slovo
+  // bit 8 musi byt 0
+  // ----------------------------------------------------------
+
   if ((w & 0x0100) == 0)
   {
     if (currentLength < sizeof(currentFrame))
@@ -136,8 +147,8 @@ void IRAM_ATTR addBit(uint8_t bitValue)
   }
   else
   {
-    // Stratili sme zarovnanie.
-    // Znova cakame na 111111111.
+    // Stratena synchronizacia
+
     synced = false;
     currentLength = 0;
     word9 = 0;
@@ -149,111 +160,92 @@ void IRAM_ATTR addBit(uint8_t bitValue)
 // ============================================================
 // INTERRUPT GPIO27
 //
-// NOVINKA:
-// Ak motor vytvori falosne hrany medzi skutocnymi ALDL bitmi,
-// nebudeme ich povazovat za novy bit.
+// BC547 INVERTUJE SIGNAL
+//
+// cca 365 us  = BIT 0
+// cca 4395 us = BIT 1
+//
+// ALDL cca 160 baud
+// jeden bit cca 6250 us
 // ============================================================
+
 void IRAM_ATTR aldlISR()
 {
-  uint32_t now = micros();
   bool state = digitalRead(ALDL_PIN);
 
-  // ==========================================================
+  unsigned long now = micros();
+
+
+  // ----------------------------------------------------------
   // RISING EDGE
-  // ==========================================================
+  // zaciatok pulzu
+  // ----------------------------------------------------------
+
   if (state)
   {
-    // Prvy impulz po starte
-    if (!haveBitCell)
-    {
-      haveBitCell = true;
-      lastBitStart = now;
-      pulseStart = now;
-      bitAlreadyRead = false;
+    // Odmietnutie prilis skoreho dalsieho impulzu
 
+    if (lastAcceptedRise != 0)
+    {
+      unsigned long spacing =
+        now - lastAcceptedRise;
+
+      if (spacing < MIN_BIT_SPACING_US)
+      {
+        ignoredEdgesTotal++;
+        return;
+      }
+    }
+
+    lastAcceptedRise = now;
+    pulseStart = now;
+    pulseActive = true;
+  }
+
+
+  // ----------------------------------------------------------
+  // FALLING EDGE
+  // koniec pulzu
+  // ----------------------------------------------------------
+
+  else
+  {
+    if (!pulseActive)
+    {
+      ignoredEdgesTotal++;
       return;
     }
 
-    uint32_t sinceLastBit =
-      now - lastBitStart;
+    unsigned long width =
+      now - pulseStart;
 
-    // Dalsi skutocny ALDL bit nemoze prist hned.
-    // Pri 160 baud ocakavame cca 6250 us.
-    if (sinceLastBit >= MIN_BIT_SPACING_US)
+    pulseActive = false;
+
+
+    // Neplatny pulz
+
+    if (width < MIN_PULSE_US ||
+        width > MAX_PULSE_US)
     {
-      lastBitStart = now;
-      pulseStart = now;
-      bitAlreadyRead = false;
+      invalidPulsesTotal++;
+      return;
     }
+
+
+    // BIT 0
+
+    if (width < BIT_SPLIT_US)
+    {
+      addBit(0);
+    }
+
+
+    // BIT 1
+
     else
     {
-      // Toto je pravdepodobne rusiva hrana
-      ignoredEdgesTotal++;
+      addBit(1);
     }
-
-    return;
-  }
-
-
-  // ==========================================================
-  // FALLING EDGE
-  // ==========================================================
-  if (!haveBitCell)
-    return;
-
-  // Z tohto bitoveho intervalu sme uz jeden bit precitali.
-  // Dalsie falling hrany ignorujeme.
-  if (bitAlreadyRead)
-  {
-    ignoredEdgesTotal++;
-    return;
-  }
-
-  uint32_t width =
-    now - pulseStart;
-
-
-  // ==========================================================
-  // VELMI KRATKY IMPULZ = RUSENIE
-  //
-  // Dolezite:
-  // bit este NEuzatvarame.
-  // Cakame, ci pride skutocny koniec povodneho pulzu.
-  // ==========================================================
-  if (width < MIN_PULSE_US)
-  {
-    ignoredEdgesTotal++;
-    return;
-  }
-
-
-  // Od tejto chvile uz tento bitovy interval povazujeme
-  // za precitany.
-  bitAlreadyRead = true;
-
-
-  // ==========================================================
-  // BIT 0
-  // ==========================================================
-  if (width < BIT_SPLIT_US)
-  {
-    addBit(0);
-  }
-
-  // ==========================================================
-  // BIT 1
-  // ==========================================================
-  else if (width <= MAX_PULSE_US)
-  {
-    addBit(1);
-  }
-
-  // ==========================================================
-  // NEPLATNY / PRILIS DLHY IMPULZ
-  // ==========================================================
-  else
-  {
-    invalidPulsesTotal++;
   }
 }
 
@@ -261,6 +253,7 @@ void IRAM_ATTR aldlISR()
 // ============================================================
 // A20 POMOCNE FUNKCIE
 // ============================================================
+
 uint8_t B(uint8_t *frame, uint8_t number)
 {
   return frame[number - 1];
@@ -275,8 +268,24 @@ uint16_t W(uint8_t *frame, uint8_t number)
 
 
 // ============================================================
+// VYPIS BYTE V BINARNOM TVARE
+// ============================================================
+
+void printBinaryByte(uint8_t value)
+{
+  for (int i = 7; i >= 0; i--)
+  {
+    SerialBT.print(
+      (value >> i) & 0x01
+    );
+  }
+}
+
+
+// ============================================================
 // TEPLOTNA TABULKA A20
 // ============================================================
+
 float temperatureC(uint8_t raw)
 {
   const uint8_t rawTable[] =
@@ -289,6 +298,7 @@ float temperatureC(uint8_t raw)
     237, 239, 240, 241, 243, 255
   };
 
+
   const float tempTable[] =
   {
     -40, -30, -25, -20, -15, -10, -5, 0,
@@ -299,14 +309,18 @@ float temperatureC(uint8_t raw)
     130, 135, 140, 145, 150, 200
   };
 
+
   const int count =
     sizeof(rawTable) / sizeof(rawTable[0]);
+
 
   if (raw <= rawTable[0])
     return tempTable[0];
 
+
   if (raw >= rawTable[count - 1])
     return tempTable[count - 1];
+
 
   for (int i = 0; i < count - 1; i++)
   {
@@ -319,12 +333,14 @@ float temperatureC(uint8_t raw)
       float y1 = tempTable[i];
       float y2 = tempTable[i + 1];
 
+
       return y1 +
              ((float)raw - x1) *
              (y2 - y1) /
              (x2 - x1);
     }
   }
+
 
   return 0;
 }
@@ -333,6 +349,7 @@ float temperatureC(uint8_t raw)
 // ============================================================
 // DTC
 // ============================================================
+
 void printDTC(uint8_t *frame)
 {
   uint8_t b12 = B(frame, 12);
@@ -341,35 +358,155 @@ void printDTC(uint8_t *frame)
 
   bool any = false;
 
+
   SerialBT.print("DTC: ");
 
-  if (b12 & 0x80) { SerialBT.print("12 "); any = true; }
-  if (b12 & 0x40) { SerialBT.print("13 "); any = true; }
-  if (b12 & 0x20) { SerialBT.print("14 "); any = true; }
-  if (b12 & 0x10) { SerialBT.print("15 "); any = true; }
-  if (b12 & 0x08) { SerialBT.print("21 "); any = true; }
-  if (b12 & 0x04) { SerialBT.print("22 "); any = true; }
-  if (b12 & 0x02) { SerialBT.print("23 "); any = true; }
-  if (b12 & 0x01) { SerialBT.print("24 "); any = true; }
 
-  if (b13 & 0x80) { SerialBT.print("25 "); any = true; }
-  if (b13 & 0x20) { SerialBT.print("32 "); any = true; }
-  if (b13 & 0x10) { SerialBT.print("33 "); any = true; }
-  if (b13 & 0x08) { SerialBT.print("34 "); any = true; }
-  if (b13 & 0x02) { SerialBT.print("41 "); any = true; }
-  if (b13 & 0x01) { SerialBT.print("42 "); any = true; }
+  // BYTE 12
 
-  if (b14 & 0x80) { SerialBT.print("43 "); any = true; }
-  if (b14 & 0x40) { SerialBT.print("44 "); any = true; }
-  if (b14 & 0x20) { SerialBT.print("45 "); any = true; }
-  if (b14 & 0x10) { SerialBT.print("51 "); any = true; }
-  if (b14 & 0x08) { SerialBT.print("52 "); any = true; }
-  if (b14 & 0x04) { SerialBT.print("53 "); any = true; }
-  if (b14 & 0x02) { SerialBT.print("54 "); any = true; }
-  if (b14 & 0x01) { SerialBT.print("55 "); any = true; }
+  if (b12 & 0x80)
+  {
+    SerialBT.print("12 ");
+    any = true;
+  }
+
+  if (b12 & 0x40)
+  {
+    SerialBT.print("13 ");
+    any = true;
+  }
+
+  if (b12 & 0x20)
+  {
+    SerialBT.print("14 ");
+    any = true;
+  }
+
+  if (b12 & 0x10)
+  {
+    SerialBT.print("15 ");
+    any = true;
+  }
+
+  if (b12 & 0x08)
+  {
+    SerialBT.print("21 ");
+    any = true;
+  }
+
+  if (b12 & 0x04)
+  {
+    SerialBT.print("22 ");
+    any = true;
+  }
+
+  if (b12 & 0x02)
+  {
+    SerialBT.print("23 ");
+    any = true;
+  }
+
+  if (b12 & 0x01)
+  {
+    SerialBT.print("24 ");
+    any = true;
+  }
+
+
+  // BYTE 13
+
+  if (b13 & 0x80)
+  {
+    SerialBT.print("25 ");
+    any = true;
+  }
+
+  if (b13 & 0x20)
+  {
+    SerialBT.print("32 ");
+    any = true;
+  }
+
+  if (b13 & 0x10)
+  {
+    SerialBT.print("33 ");
+    any = true;
+  }
+
+  if (b13 & 0x08)
+  {
+    SerialBT.print("34 ");
+    any = true;
+  }
+
+  if (b13 & 0x02)
+  {
+    SerialBT.print("41 ");
+    any = true;
+  }
+
+  if (b13 & 0x01)
+  {
+    SerialBT.print("42 ");
+    any = true;
+  }
+
+
+  // BYTE 14
+
+  if (b14 & 0x80)
+  {
+    SerialBT.print("43 ");
+    any = true;
+  }
+
+  if (b14 & 0x40)
+  {
+    SerialBT.print("44 ");
+    any = true;
+  }
+
+  if (b14 & 0x20)
+  {
+    SerialBT.print("45 ");
+    any = true;
+  }
+
+  if (b14 & 0x10)
+  {
+    SerialBT.print("51 ");
+    any = true;
+  }
+
+  if (b14 & 0x08)
+  {
+    SerialBT.print("52 ");
+    any = true;
+  }
+
+  if (b14 & 0x04)
+  {
+    SerialBT.print("53 ");
+    any = true;
+  }
+
+  if (b14 & 0x02)
+  {
+    SerialBT.print("54 ");
+    any = true;
+  }
+
+  if (b14 & 0x01)
+  {
+    SerialBT.print("55 ");
+    any = true;
+  }
+
 
   if (!any)
+  {
     SerialBT.print("NONE");
+  }
 
   SerialBT.println();
 }
@@ -378,125 +515,196 @@ void printDTC(uint8_t *frame)
 // ============================================================
 // DEKODOVANIE A20
 // ============================================================
+
 void decodeA20(uint8_t *frame, uint8_t length)
 {
   if (length != 25)
     return;
 
+
   static unsigned long frameCounter = 0;
 
   frameCounter++;
 
+
   SerialBT.println();
-  SerialBT.println("================================");
+
+  SerialBT.println(
+    "================================"
+  );
+
 
   SerialBT.print("FRAME #: ");
   SerialBT.println(frameCounter);
 
+
   SerialBT.print("TIME: ");
-  SerialBT.print(millis() / 1000.0, 1);
+  SerialBT.print(
+    millis() / 1000.0,
+    1
+  );
   SerialBT.println(" s");
 
-  SerialBT.println("FIREBIRD 2.8 V6 MPFI");
-  SerialBT.println("--------------------------------");
+
+  SerialBT.println(
+    "FIREBIRD 2.8 V6 MPFI"
+  );
+
+  SerialBT.println(
+    "--------------------------------"
+  );
 
 
+  // ==========================================================
   // RPM
-  int rpm = B(frame, 8) * 25;
+  // ==========================================================
+
+  int rpm =
+    B(frame, 8) * 25;
+
 
   SerialBT.print("RPM: ");
   SerialBT.print(rpm);
   SerialBT.println(" rpm");
 
 
+  // ==========================================================
   // COOLANT
-  uint8_t coolantRaw = B(frame, 5);
-  float coolant = temperatureC(coolantRaw);
+  // ==========================================================
+
+  uint8_t coolantRaw =
+    B(frame, 5);
+
+  float coolant =
+    temperatureC(coolantRaw);
+
 
   SerialBT.print("COOLANT: ");
   SerialBT.print(coolant, 1);
   SerialBT.println(" C");
 
+
   SerialBT.print("COOLANT RAW: ");
   SerialBT.println(coolantRaw);
 
 
+  // ==========================================================
   // MAT
-  uint8_t matRaw = B(frame, 16);
-  float mat = temperatureC(matRaw);
+  // ==========================================================
+
+  uint8_t matRaw =
+    B(frame, 16);
+
+  float mat =
+    temperatureC(matRaw);
+
 
   SerialBT.print("MAT: ");
   SerialBT.print(mat, 1);
   SerialBT.println(" C");
 
+
   SerialBT.print("MAT RAW: ");
   SerialBT.println(matRaw);
 
 
+  // ==========================================================
   // TPS
+  // ==========================================================
+
   float tps =
     B(frame, 9) * 0.019600;
+
 
   SerialBT.print("TPS: ");
   SerialBT.print(tps, 2);
   SerialBT.println(" V");
 
 
+  // ==========================================================
   // SPEED
+  // ==========================================================
+
   float speedKmh =
     B(frame, 6) * 1.60934;
+
 
   SerialBT.print("SPEED: ");
   SerialBT.print(speedKmh, 1);
   SerialBT.println(" km/h");
 
 
+  // ==========================================================
   // IAC
+  // ==========================================================
+
   SerialBT.print("IAC: ");
   SerialBT.print(B(frame, 4));
   SerialBT.println(" steps");
 
 
-  // O2
+  // ==========================================================
+  // O2 SENSOR
+  // ==========================================================
+
   float o2 =
     B(frame, 11) * 4.44;
+
 
   SerialBT.print("O2: ");
   SerialBT.print(o2, 0);
   SerialBT.println(" mV");
 
 
+  // ==========================================================
   // INT
+  // ==========================================================
+
   SerialBT.print("INT: ");
   SerialBT.println(B(frame, 10));
 
 
+  // ==========================================================
   // BLM
+  // ==========================================================
+
   SerialBT.print("BLM: ");
   SerialBT.println(B(frame, 19));
 
 
+  // ==========================================================
   // MAF
+  // ==========================================================
+
   float maf =
     W(frame, 22) * 0.003906;
+
 
   SerialBT.print("MAF: ");
   SerialBT.print(maf, 2);
   SerialBT.println(" g/s");
 
 
+  // ==========================================================
   // INJECTOR BPW
+  // ==========================================================
+
   float injector =
     W(frame, 24) * 0.015300;
+
 
   SerialBT.print("INJ BPW: ");
   SerialBT.print(injector, 2);
   SerialBT.println(" ms");
 
 
+  // ==========================================================
   // EGR
+  // ==========================================================
+
   float egr =
     B(frame, 7) * 0.390625;
+
 
   SerialBT.print("EGR: ");
   SerialBT.print(egr, 1);
@@ -504,97 +712,271 @@ void decodeA20(uint8_t *frame, uint8_t length)
 
 
   // ==========================================================
-  // FAN REQUEST
+  // BYTE 17
   //
-  // A20 byte 17, bit 1:
-  // 1 = OFF
-  // 0 = ON
+  // BIT 1 = FAN REQUEST
+  // BIT 7 = A/C REQUEST
+  // BIT 3 = POWER STEERING PRESSURE
   // ==========================================================
+
+  uint8_t byte17 =
+    B(frame, 17);
+
+
+  // FAN
+  // A20:
+  // bit SET   = OFF
+  // bit CLEAR = ON
+
   bool fanRequest =
-    !(B(frame, 17) & 0x02);
+    !(byte17 & 0x02);
+
 
   SerialBT.print("FAN REQUEST: ");
+
   SerialBT.println(
     fanRequest ? "ON" : "OFF"
   );
+
+
   // A/C REQUEST
+  // A20:
+  // bit CLEAR = YES
+  // bit SET   = NO
+
   bool acRequest =
-    !(B(frame, 17) & 0x80);
+    !(byte17 & 0x80);
+
 
   SerialBT.print("A/C REQUEST: ");
-  SerialBT.println(acRequest ? "YES" : "NO");
 
-// RAW BYTE 17
+  SerialBT.println(
+    acRequest ? "YES" : "NO"
+  );
+
+
+  // ==========================================================
+  // NOVINKA 1
+  // POWER STEERING PRESSURE
+  //
+  // BYTE 17 BIT 3
+  // SET = EXCESSIVE
+  // ==========================================================
+
+  bool powerSteeringPressure =
+    byte17 & 0x08;
+
+
+  SerialBT.print(
+    "POWER STEERING PRESSURE: "
+  );
+
+  SerialBT.println(
+    powerSteeringPressure
+      ? "EXCESSIVE"
+      : "NORMAL"
+  );
+
+
+  // BYTE17 RAW
+
   SerialBT.print("BYTE17 RAW: ");
-  SerialBT.println(B(frame, 17));
+  SerialBT.println(byte17);
 
 
-  // LOAD
+  // BYTE17 BINARY
+
+  SerialBT.print("BYTE17 BIN: ");
+
+  printBinaryByte(byte17);
+
+  SerialBT.println();
+
+
+  // ==========================================================
+  // BYTE 1
+  //
+  // BIT 7 = MAF PULSE
+  // BIT 2 = CRANK PULSE
+  // BIT 0 = VSS PULSE
+  // BIT 5 = ALDL MODE
+  // ==========================================================
+
+  uint8_t byte1 =
+    B(frame, 1);
+
+
+  // ==========================================================
+  // NOVINKA 2
+  // MAF PULSE
+  // ==========================================================
+
+  bool mafPulse =
+    byte1 & 0x80;
+
+
+  SerialBT.print("MAF PULSE: ");
+
+  SerialBT.println(
+    mafPulse ? "YES" : "NO"
+  );
+
+
+  // ==========================================================
+  // NOVINKA 3
+  // VSS PULSE
+  // ==========================================================
+
+  bool vssPulse =
+    byte1 & 0x01;
+
+
+  SerialBT.print("VSS PULSE: ");
+
+  SerialBT.println(
+    vssPulse ? "YES" : "NO"
+  );
+
+
+  // ==========================================================
+  // NOVINKA 4
+  // CRANK PULSE
+  // ==========================================================
+
+  bool crankPulse =
+    byte1 & 0x04;
+
+
+  SerialBT.print("CRANK PULSE: ");
+
+  SerialBT.println(
+    crankPulse ? "YES" : "NO"
+  );
+
+
+  // ==========================================================
+  // LOAD VARIABLE
+  // ==========================================================
+
   SerialBT.print("LOAD: ");
   SerialBT.println(B(frame, 18));
 
 
+  // ==========================================================
   // O2 CROSSOVER
+  // ==========================================================
+
   SerialBT.print("O2 CROSS: ");
   SerialBT.println(B(frame, 20));
 
 
-  // LOOP
+  // ==========================================================
+  // LOOP STATUS
+  //
+  // BYTE 15 BIT 7
+  // ==========================================================
+
   bool closedLoop =
     B(frame, 15) & 0x80;
 
+
   SerialBT.print("LOOP: ");
+
   SerialBT.println(
-    closedLoop ? "CLOSED" : "OPEN"
+    closedLoop
+      ? "CLOSED"
+      : "OPEN"
   );
 
 
-  // MIXTURE
+  // ==========================================================
+  // RICH / LEAN
+  //
+  // BYTE 15 BIT 6
+  // ==========================================================
+
   bool rich =
     B(frame, 15) & 0x40;
 
+
   SerialBT.print("MIXTURE: ");
+
   SerialBT.println(
-    rich ? "RICH" : "LEAN"
+    rich
+      ? "RICH"
+      : "LEAN"
   );
 
 
+  // ==========================================================
   // BLM ENABLE
+  //
+  // BYTE 15 BIT 1
+  // ==========================================================
+
   bool blmEnable =
     B(frame, 15) & 0x02;
 
+
   SerialBT.print("BLM ENABLE: ");
+
   SerialBT.println(
-    blmEnable ? "YES" : "NO"
+    blmEnable
+      ? "YES"
+      : "NO"
   );
 
 
+  // ==========================================================
   // ALDL MODE
+  //
+  // BYTE 1 BIT 5
+  // ==========================================================
+
   bool aldlMode =
-    B(frame, 1) & 0x20;
+    byte1 & 0x20;
+
 
   SerialBT.print("ALDL MODE: ");
+
   SerialBT.println(
-    aldlMode ? "YES" : "NO"
+    aldlMode
+      ? "YES"
+      : "NO"
   );
 
+
+  // ==========================================================
+  // DTC
+  // ==========================================================
 
   printDTC(frame);
 
-  SerialBT.println("================================");
+
+  SerialBT.println(
+    "================================"
+  );
 }
 
 
 // ============================================================
 // SETUP
 // ============================================================
+
 void setup()
 {
   Serial.begin(115200);
 
-  SerialBT.begin("FIREBIRD_ECM");
+  SerialBT.begin(
+    "FIREBIRD_ECM"
+  );
 
-  pinMode(ALDL_PIN, INPUT);
+
+  pinMode(
+    ALDL_PIN,
+    INPUT
+  );
+
 
   attachInterrupt(
     digitalPinToInterrupt(ALDL_PIN),
@@ -602,50 +984,75 @@ void setup()
     CHANGE
   );
 
-  Serial.println();
-  Serial.println("FIREBIRD ECM MONITOR STARTED");
-  Serial.println("ENGINE NOISE FILTER ACTIVE");
+
+  Serial.println(
+    "FIREBIRD ECM MONITOR STARTED"
+  );
+
+  SerialBT.println(
+    "FIREBIRD ECM MONITOR STARTED"
+  );
 }
 
 
 // ============================================================
 // LOOP
 // ============================================================
+
 void loop()
 {
   static unsigned long lastDiagnostic = 0;
+
   static unsigned long previousBits = 0;
+
   static unsigned long previousIgnored = 0;
+
   static unsigned long previousInvalid = 0;
 
   static unsigned long lastGoodFrame = 0;
 
 
-  // ==========================================================
+  // ----------------------------------------------------------
   // HOTOVY FRAME
-  // ==========================================================
+  // ----------------------------------------------------------
+
   if (frameReady)
   {
     uint8_t localFrame[32];
     uint8_t localLength;
 
+
     noInterrupts();
 
-    localLength = readyLength;
 
-    for (uint8_t i = 0; i < localLength; i++)
+    localLength =
+      readyLength;
+
+
+    for (
+      uint8_t i = 0;
+      i < localLength;
+      i++
+    )
     {
-      localFrame[i] = readyFrame[i];
+      localFrame[i] =
+        readyFrame[i];
     }
 
+
     frameReady = false;
+
 
     interrupts();
 
 
+    // A20 musi mat presne 25 bytov
+
     if (localLength == 25)
     {
-      lastGoodFrame = millis();
+      lastGoodFrame =
+        millis();
+
 
       decodeA20(
         localFrame,
@@ -655,70 +1062,121 @@ void loop()
   }
 
 
-  // ==========================================================
-  // DIAGNOSTIKA KAZDE 2 SEKUNDY
-  // ==========================================================
-  if (millis() - lastDiagnostic >= 2000)
+  // ----------------------------------------------------------
+  // DIAGNOSTIKA SIGNALU KAZDE 2 SEKUNDY
+  // ----------------------------------------------------------
+
+  if (
+    millis() - lastDiagnostic >= 2000
+  )
   {
-    lastDiagnostic = millis();
+    lastDiagnostic =
+      millis();
+
 
     unsigned long bitsNow;
+
     unsigned long ignoredNow;
+
     unsigned long invalidNow;
+
 
     noInterrupts();
 
-    bitsNow = validBitsTotal;
-    ignoredNow = ignoredEdgesTotal;
-    invalidNow = invalidPulsesTotal;
+
+    bitsNow =
+      validBitsTotal;
+
+    ignoredNow =
+      ignoredEdgesTotal;
+
+    invalidNow =
+      invalidPulsesTotal;
+
 
     interrupts();
 
 
-    unsigned long bitsDifference =
+    unsigned long bitDifference =
       bitsNow - previousBits;
+
 
     unsigned long ignoredDifference =
       ignoredNow - previousIgnored;
+
 
     unsigned long invalidDifference =
       invalidNow - previousInvalid;
 
 
-    previousBits = bitsNow;
-    previousIgnored = ignoredNow;
-    previousInvalid = invalidNow;
+    previousBits =
+      bitsNow;
+
+    previousIgnored =
+      ignoredNow;
+
+    previousInvalid =
+      invalidNow;
 
 
-    // Ak uz 3 sekundy nebol cely frame,
-    // ukaz diagnostiku
-    if (millis() - lastGoodFrame > 3000)
+    unsigned long bitsPerSecond =
+      bitDifference / 2;
+
+
+    // --------------------------------------------------------
+    // Ak uz dlhsie nemame dobry A20 frame
+    // --------------------------------------------------------
+
+    if (
+      millis() - lastGoodFrame > 3000
+    )
     {
       SerialBT.println();
 
+
       SerialBT.print("SIGNAL: ");
 
-      if (bitsDifference > 0)
+      if (bitsPerSecond > 0)
+      {
         SerialBT.println("YES");
+      }
       else
+      {
         SerialBT.println("NO");
+      }
 
 
       SerialBT.print("BITS/s: ");
-      SerialBT.println(bitsDifference / 2);
+
+      SerialBT.println(
+        bitsPerSecond
+      );
 
 
-      SerialBT.print("IGNORED NOISE/2s: ");
-      SerialBT.println(ignoredDifference);
+      SerialBT.print(
+        "IGNORED NOISE/2s: "
+      );
+
+      SerialBT.println(
+        ignoredDifference
+      );
 
 
-      SerialBT.print("INVALID PULSES/2s: ");
-      SerialBT.println(invalidDifference);
+      SerialBT.print(
+        "INVALID PULSES/2s: "
+      );
+
+      SerialBT.println(
+        invalidDifference
+      );
 
 
       SerialBT.print("SYNC: ");
+
       SerialBT.println(
-        synced ? "YES" : "SEARCHING"
+        synced
+          ? "YES"
+          : "SEARCHING"
       );
 
 
